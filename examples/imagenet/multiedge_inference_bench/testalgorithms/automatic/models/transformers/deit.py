@@ -8,7 +8,7 @@ import torch
 from torch import nn
 from transformers import DeiTConfig
 from transformers.models.deit.modeling_deit import DeiTEmbeddings
-from transformers.models.vit.modeling_vit import (
+from .vit import (
     ViTIntermediate, ViTOutput, ViTSelfAttention, ViTSelfOutput
 )
 from .. import ModuleShard, ModuleShardConfig
