@@ -65,9 +65,7 @@ def compute(key, matrix):
             break
 
     if not flag:
-        bwt_score = np.nan
-        fwt_score = np.nan
-        return bwt_score, fwt_score
+        return None, np.nan, np.nan
 
     for i in range(length - 1):
         for j in range(length - 1):
