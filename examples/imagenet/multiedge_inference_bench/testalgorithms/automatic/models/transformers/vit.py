@@ -15,88 +15,39 @@ logger = logging.getLogger(__name__)
 
 try:
     from transformers.models.vit.modeling_vit import (
-        ViTEmbeddings, ViTIntermediate, ViTOutput, ViTSelfAttention, ViTSelfOutput
+        ViTEmbeddings, ViTAttention
     )
-except ImportError:
-    try:
-        from transformers.models.vit.modeling_vit import ViTEmbeddings
-    except ImportError as embeddings_err:
-        raise ImportError(
-            "Ianvs ViT fallback requires ViTEmbeddings from "
-            "transformers.models.vit.modeling_vit; this transformers version "
-            "is not supported by the ImageNet multiedge inference example."
-        ) from embeddings_err
+except ImportError as err:
+    raise ImportError(
+        "Ianvs ImageNet multiedge inference example requires ViTEmbeddings "
+        "and ViTAttention from transformers.models.vit.modeling_vit; this "
+        "transformers version is not supported."
+    ) from err
 
+try:
+    from transformers.models.vit.modeling_vit import ViTMLP
+except ImportError:
     from transformers.activations import ACT2FN
 
     logger.warning(
-        "transformers>=5.0 detected: using Ianvs's bundled ViT attention/MLP "
-        "implementations. Benchmark figures are not directly comparable with "
-        "runs against transformers<5.0."
+        "transformers without ViTMLP detected: using Ianvs's bundled ViT MLP "
+        "implementation. Benchmark figures are not directly comparable with "
+        "runs against transformers versions that provide ViTMLP."
     )
 
-    class ViTSelfAttention(nn.Module):
+    class ViTMLP(nn.Module):
         def __init__(self, config):
             super().__init__()
-            self.num_attention_heads = config.num_attention_heads
-            self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
-            self.all_head_size = self.num_attention_heads * self.attention_head_size
-            self.query = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
-            self.key = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
-            self.value = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
-            self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
-        def transpose_for_scores(self, x):
-            new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
-            x = x.view(*new_x_shape)
-            return x.permute(0, 2, 1, 3)
-        def forward(self, hidden_states, head_mask=None, output_attentions=False):
-            mixed_query_layer = self.query(hidden_states)
-            key_layer = self.transpose_for_scores(self.key(hidden_states))
-            value_layer = self.transpose_for_scores(self.value(hidden_states))
-            query_layer = self.transpose_for_scores(mixed_query_layer)
-            attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
-            attention_scores = attention_scores / math.sqrt(self.attention_head_size)
-            attention_probs = nn.functional.softmax(attention_scores, dim=-1)
-            attention_probs = self.dropout(attention_probs)
-            context_layer = torch.matmul(attention_probs, value_layer)
-            context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
-            new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
-            context_layer = context_layer.view(*new_context_layer_shape)
-            return (context_layer,)
+            self.activation_fn = ACT2FN[config.hidden_act]
+            self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
+            self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
 
-    class ViTSelfOutput(nn.Module):
-        def __init__(self, config):
-            super().__init__()
-            self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-            self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        def forward(self, hidden_states, input_tensor):
-            hidden_states = self.dense(hidden_states)
-            hidden_states = self.dropout(hidden_states)
-            return hidden_states
-
-    class ViTIntermediate(nn.Module):
-        def __init__(self, config):
-            super().__init__()
-            self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
-            if isinstance(config.hidden_act, str):
-                self.intermediate_act_fn = ACT2FN[config.hidden_act]
-            else:
-                self.intermediate_act_fn = config.hidden_act
         def forward(self, hidden_states):
-            hidden_states = self.dense(hidden_states)
-            hidden_states = self.intermediate_act_fn(hidden_states)
+            hidden_states = self.fc1(hidden_states)
+            hidden_states = self.activation_fn(hidden_states)
+            hidden_states = self.fc2(hidden_states)
             return hidden_states
 
-    class ViTOutput(nn.Module):
-        def __init__(self, config):
-            super().__init__()
-            self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
-            self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        def forward(self, hidden_states, input_tensor):
-            hidden_states = self.dense(hidden_states)
-            hidden_states = self.dropout(hidden_states)
-            hidden_states = hidden_states + input_tensor
-            return hidden_states
 from .. import ModuleShard, ModuleShardConfig
 from . import TransformerShardData
 
@@ -124,31 +75,23 @@ class ViTLayerShard(ModuleShard):
         if self.has_layer(0):
             self.layernorm_before = nn.LayerNorm(self.config.hidden_size,
                                                  eps=self.config.layer_norm_eps)
-            self.self_attention = ViTSelfAttention(self.config)
-        if self.has_layer(1):
-            self.self_output = ViTSelfOutput(self.config)
+            self.attention = ViTAttention(self.config)
         if self.has_layer(2):
             self.layernorm_after = nn.LayerNorm(self.config.hidden_size,
                                                 eps=self.config.layer_norm_eps)
-            self.intermediate = ViTIntermediate(self.config)
-        if self.has_layer(3):
-            self.output = ViTOutput(self.config)
+            self.mlp = ViTMLP(self.config)
 
     @torch.no_grad()
     def forward(self, data: TransformerShardData) -> TransformerShardData:
         """Compute layer shard."""
         if self.has_layer(0):
+            residual = data
             data_norm = self.layernorm_before(data)
-            data = (self.self_attention(data_norm)[0], data)
-        if self.has_layer(1):
-            skip = data[1]
-            data = self.self_output(data[0], skip)
-            data += skip
+            data = self.attention(data_norm, attention_mask=None)[0] + residual
         if self.has_layer(2):
+            residual = data
             data_norm = self.layernorm_after(data)
-            data = (self.intermediate(data_norm), data)
-        if self.has_layer(3):
-            data = self.output(data[0], data[1])
+            data = self.mlp(data_norm) + residual
         return data
 
 
@@ -222,23 +165,21 @@ class ViTModelShard(ModuleShard):
         if layer.has_layer(0):
             layer.layernorm_before.weight.copy_(torch.from_numpy(weights[root + "LayerNorm_0/scale"]))
             layer.layernorm_before.bias.copy_(torch.from_numpy(weights[root + "LayerNorm_0/bias"]))
-            layer.self_attention.query.weight.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/query/kernel"]).view(hidden_size, hidden_size).t())
-            layer.self_attention.key.weight.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/key/kernel"]).view(hidden_size, hidden_size).t())
-            layer.self_attention.value.weight.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/value/kernel"]).view(hidden_size, hidden_size).t())
-            layer.self_attention.query.bias.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/query/bias"]).view(-1))
-            layer.self_attention.key.bias.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/key/bias"]).view(-1))
-            layer.self_attention.value.bias.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/value/bias"]).view(-1))
-        if layer.has_layer(1):
-            layer.self_output.dense.weight.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/out/kernel"]).view(hidden_size, hidden_size).t())
-            layer.self_output.dense.bias.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/out/bias"]).view(-1))
+            layer.attention.q_proj.weight.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/query/kernel"]).view(hidden_size, hidden_size).t())
+            layer.attention.k_proj.weight.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/key/kernel"]).view(hidden_size, hidden_size).t())
+            layer.attention.v_proj.weight.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/value/kernel"]).view(hidden_size, hidden_size).t())
+            layer.attention.q_proj.bias.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/query/bias"]).view(-1))
+            layer.attention.k_proj.bias.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/key/bias"]).view(-1))
+            layer.attention.v_proj.bias.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/value/bias"]).view(-1))
+            layer.attention.o_proj.weight.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/out/kernel"]).view(hidden_size, hidden_size).t())
+            layer.attention.o_proj.bias.copy_(torch.from_numpy(weights[root + "MultiHeadDotProductAttention_1/out/bias"]).view(-1))
         if layer.has_layer(2):
             layer.layernorm_after.weight.copy_(torch.from_numpy(weights[root + "LayerNorm_2/scale"]))
             layer.layernorm_after.bias.copy_(torch.from_numpy(weights[root + "LayerNorm_2/bias"]))
-            layer.intermediate.dense.weight.copy_(torch.from_numpy(weights[root + "MlpBlock_3/Dense_0/kernel"]).t())
-            layer.intermediate.dense.bias.copy_(torch.from_numpy(weights[root + "MlpBlock_3/Dense_0/bias"]).t())
-        if layer.has_layer(3):
-            layer.output.dense.weight.copy_(torch.from_numpy(weights[root + "MlpBlock_3/Dense_1/kernel"]).t())
-            layer.output.dense.bias.copy_(torch.from_numpy(weights[root + "MlpBlock_3/Dense_1/bias"]).t())
+            layer.mlp.fc1.weight.copy_(torch.from_numpy(weights[root + "MlpBlock_3/Dense_0/kernel"]).t())
+            layer.mlp.fc1.bias.copy_(torch.from_numpy(weights[root + "MlpBlock_3/Dense_0/bias"]).t())
+            layer.mlp.fc2.weight.copy_(torch.from_numpy(weights[root + "MlpBlock_3/Dense_1/kernel"]).t())
+            layer.mlp.fc2.bias.copy_(torch.from_numpy(weights[root + "MlpBlock_3/Dense_1/bias"]).t())
 
     @torch.no_grad()
     def forward(self, data: TransformerShardData) -> TransformerShardData:
