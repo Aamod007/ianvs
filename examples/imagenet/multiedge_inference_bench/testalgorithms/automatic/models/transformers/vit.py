@@ -9,13 +9,32 @@ import requests
 import torch
 from torch import nn
 from transformers import ViTConfig
+
+
+logger = logging.getLogger(__name__)
+
 try:
     from transformers.models.vit.modeling_vit import (
         ViTEmbeddings, ViTIntermediate, ViTOutput, ViTSelfAttention, ViTSelfOutput
     )
 except ImportError:
-    from transformers.models.vit.modeling_vit import ViTEmbeddings
+    try:
+        from transformers.models.vit.modeling_vit import ViTEmbeddings
+    except ImportError as embeddings_err:
+        raise ImportError(
+            "Ianvs ViT fallback requires ViTEmbeddings from "
+            "transformers.models.vit.modeling_vit; this transformers version "
+            "is not supported by the ImageNet multiedge inference example."
+        ) from embeddings_err
+
     from transformers.activations import ACT2FN
+
+    logger.warning(
+        "transformers>=5.0 detected: using Ianvs's bundled ViT attention/MLP "
+        "implementations. Benchmark figures are not directly comparable with "
+        "runs against transformers<5.0."
+    )
+
     class ViTSelfAttention(nn.Module):
         def __init__(self, config):
             super().__init__()
@@ -80,9 +99,6 @@ except ImportError:
             return hidden_states
 from .. import ModuleShard, ModuleShardConfig
 from . import TransformerShardData
-
-
-logger = logging.getLogger(__name__)
 
 _WEIGHTS_URLS = {
     'google/vit-base-patch16-224': 'https://storage.googleapis.com/vit_models/imagenet21k%2Bimagenet2012/ViT-B_16-224.npz',
